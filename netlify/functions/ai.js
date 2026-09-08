@@ -44,7 +44,7 @@ exports.handler = async function (event) {
             };
         }
 
-        const model = "gemini-3.7-flash";
+        const model = "gemini-3.8-flash";
 
         const response = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
