@@ -1,4 +1,5 @@
 exports.handler = async function (event) {
+
     const headers = {
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": "*",
@@ -6,7 +7,6 @@ exports.handler = async function (event) {
         "Access-Control-Allow-Methods": "POST, OPTIONS"
     };
 
-    // CORS preflight
     if (event.httpMethod === "OPTIONS") {
         return {
             statusCode: 204,
@@ -25,7 +25,12 @@ exports.handler = async function (event) {
         };
     }
 
+    const requestId =
+        Date.now().toString(36) +
+        Math.random().toString(36).substring(2, 8);
+
     try {
+
         const apiKey = process.env.GEMINI_API_KEY;
 
         if (!apiKey) {
@@ -33,7 +38,8 @@ exports.handler = async function (event) {
                 statusCode: 500,
                 headers,
                 body: JSON.stringify({
-                    error: "GEMINI_API_KEY is missing in Netlify."
+                    error: "GEMINI_API_KEY is missing in Netlify.",
+                    requestId
                 })
             };
         }
@@ -47,7 +53,8 @@ exports.handler = async function (event) {
                 statusCode: 400,
                 headers,
                 body: JSON.stringify({
-                    error: "Invalid JSON request."
+                    error: "Invalid JSON request.",
+                    requestId
                 })
             };
         }
@@ -60,27 +67,54 @@ exports.handler = async function (event) {
             profile = {}
         } = body;
 
-        if (
-            !message &&
-            !image &&
-            !file
-        ) {
+        if (!message && !image && !file) {
             return {
                 statusCode: 400,
                 headers,
                 body: JSON.stringify({
-                    error: "No question, image, or file was provided."
+                    error: "No question, image, or file was provided.",
+                    requestId
                 })
             };
         }
 
-        const model = "gemini-3.8-flash";
+        /*
+        ============================================================
+        BOARDMATE MODEL FALLBACK SYSTEM
+        ============================================================
+
+        Primary:
+        Gemini 3.8 Flash
+
+        Backup:
+        Gemini 3.7 Flash
+        Gemini 3.6 Flash
+        Gemini 3.5 Flash-Lite
+        */
+
+        const models = [
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite"
+        ];
+
+        const retryableStatuses = new Set([
+            429,
+            500,
+            502,
+            503,
+            504
+        ]);
+
+        const sleep = (ms) =>
+            new Promise(resolve => setTimeout(resolve, ms));
 
         /*
-         * ---------------------------------------------------------
-         * BOARDMATE SYSTEM INSTRUCTION
-         * ---------------------------------------------------------
-         */
+        ============================================================
+        SYSTEM PROMPT
+        ============================================================
+        */
 
         const systemPrompt = `
 You are BoardMate AI.
@@ -88,6 +122,7 @@ You are BoardMate AI.
 You are an educational AI tutor and exam-preparation assistant.
 
 Student profile:
+
 Class: ${profile.className || "Not specified"}
 Board: ${profile.board || "Not specified"}
 Subject: ${profile.subject || "Not specified"}
@@ -101,7 +136,7 @@ Your responsibilities:
 4. Analyze mistakes.
 5. Check student answers.
 6. Create study plans.
-7. Analyze uploaded questions/images/documents.
+7. Analyze uploaded questions, images and documents.
 8. Create exam-style practice.
 9. Adapt difficulty based on performance.
 
@@ -118,7 +153,7 @@ IMPORTANT:
 - Point out common mistakes.
 - If an uploaded image is unclear, say what cannot be read rather than inventing it.
 
-MATHEMATICS FORMATTING:
+MATHEMATICS:
 
 Do NOT use LaTeX.
 
@@ -130,15 +165,6 @@ x³
 ½
 π
 a² + b² = c²
-
-Do not output:
-
-\\\\frac{}
-\\\\sqrt{}
-\\\\text{}
-$$
-\\\\[
-\\\\]
 
 CHEMISTRY:
 
@@ -153,28 +179,19 @@ C₆H₁₂O₆
 Do not output raw LaTeX.
 
 For diagrams:
-
-Describe the diagram clearly using labels and simple structured text.
+Describe the diagram clearly using labels and structured text.
 
 For examination answers:
-
-Use:
-- Definition
-- Key points
-- Explanation
-- Example
-- Conclusion
-
-only when appropriate.
+Use suitable headings, points, keywords and conclusion where appropriate.
 
 Never unnecessarily make answers extremely long.
 `;
 
         /*
-         * ---------------------------------------------------------
-         * MODE-SPECIFIC INSTRUCTIONS
-         * ---------------------------------------------------------
-         */
+        ============================================================
+        MODE INSTRUCTIONS
+        ============================================================
+        */
 
         const modeInstructions = {
 
@@ -184,7 +201,7 @@ Explain the concept in a student-friendly way.
 `,
 
             explain: `
-Explain the topic from basic level.
+Explain the topic from the basic level.
 Use simple examples.
 Break difficult ideas into small steps.
 Assume the student may be learning the topic for the first time.
@@ -194,19 +211,20 @@ Assume the student may be learning the topic for the first time.
 Give an exam-ready answer.
 Identify important keywords.
 Use suitable headings and points.
-If the question appears to have a mark level, match the answer length.
-Do not unnecessarily add unrelated information.
+Match the answer length to the likely mark level.
+Do not add unrelated information.
 `,
 
             scanner: `
 Analyze the uploaded question carefully.
 
 First identify:
-- Subject
-- Topic/chapter
-- Question type
+1. Subject
+2. Topic/chapter
+3. Question type
 
 Then provide:
+
 1. Question
 2. Given information
 3. Required answer
@@ -215,13 +233,11 @@ Then provide:
 6. Exam-ready answer
 7. Common mistake
 
-If the image contains multiple questions, number them separately.
+If there are multiple questions, number them separately.
 `,
 
             answerChecker: `
 Act as an AI exam answer checker.
-
-Evaluate the student's answer.
 
 Return:
 
@@ -235,19 +251,16 @@ How to improve:
 Model exam answer:
 
 Be fair.
-Do not give marks merely because the answer is long.
 Focus on correctness, relevance, concepts and important points.
 `,
 
             practice: `
 Create practice questions for the selected class, board and subject.
 
-Adapt the difficulty according to the student's performance.
-
 Include:
-- Easy
-- Medium
-- Hard
+Easy
+Medium
+Hard
 
 For each question provide:
 Question
@@ -259,8 +272,6 @@ Do not immediately reveal answers unless requested.
 
             adaptive: `
 Act as an adaptive practice engine.
-
-Analyze the student's previous performance.
 
 If the student is struggling:
 - simplify the next question
@@ -275,38 +286,26 @@ If the student is doing well:
 Create the next useful practice question.
 `,
 
-            exam: `
-Create a board-style examination practice set.
-
-Include appropriate combinations of:
-MCQs
-Short-answer questions
-Long-answer questions
-Case/source-based questions
-Numericals
-Diagram-based questions where appropriate.
-
-Clearly show marks.
-Do not claim the generated paper is an official or predicted paper.
-`,
-
             simulator: `
 Create a complete exam simulation.
 
 Include:
-- Sections
-- Questions
-- Marks
-- Difficulty
-- Suggested time
+Sections
+Questions
+Marks
+Difficulty
+Suggested time
 
 Do not reveal answers unless the student asks for evaluation.
+
+This is practice and is not an official board paper.
 `,
 
             notes: `
-Analyze the uploaded notes/document.
+Analyze the uploaded notes or document.
 
 Create:
+
 1. Important concepts
 2. Key definitions
 3. Important formulas
@@ -323,25 +322,28 @@ Stay faithful to the uploaded material.
 Analyze the student's performance data.
 
 Identify:
-- Strong topics
-- Weak topics
-- Frequently wrong concepts
-- Priority topics
-- Suggested practice order
+
+Strong topics
+Weak topics
+Frequently wrong concepts
+Priority topics
+Suggested practice order
 
 Give a practical improvement strategy.
 `,
 
             studyPlan: `
 Create a realistic study plan based on:
-- Class
-- Board
-- Subject
-- Available time
-- Exam date
-- Weak topics
+
+Class
+Board
+Subject
+Available time
+Exam date
+Weak topics
 
 Include daily tasks and revision.
+
 Do not create an impossible schedule.
 `,
 
@@ -349,10 +351,10 @@ Do not create an impossible schedule.
 Create a revision session based on questions the student previously got wrong.
 
 Focus on:
-- The original concept
+- Original concept
 - Why the mistake happened
-- A similar question
-- A slightly different question
+- Similar question
+- Slightly different question
 - Final revision tip
 `,
 
@@ -360,12 +362,12 @@ Focus on:
 Explain the concept using visual-learning methods.
 
 If a diagram would help:
-- Explain what the diagram should contain
-- Give labels
-- Explain each labelled part
-- Explain how the parts relate
+- explain what the diagram should contain
+- give labels
+- explain each labelled part
+- explain how the parts relate
 
-Do not claim that an image was generated if only text was returned.
+Do not claim an image was generated if only text was returned.
 `
         };
 
@@ -373,25 +375,13 @@ Do not claim that an image was generated if only text was returned.
             modeInstructions[mode] ||
             modeInstructions.chat;
 
-        /*
-         * ---------------------------------------------------------
-         * USER PROMPT
-         * ---------------------------------------------------------
-         */
-
-        let prompt = `
+        const prompt = `
 ${instruction}
 
 Student request:
 
 ${message || "Analyze the uploaded material."}
 `;
-
-        /*
-         * ---------------------------------------------------------
-         * GEMINI CONTENT PARTS
-         * ---------------------------------------------------------
-         */
 
         const parts = [
             {
@@ -400,14 +390,10 @@ ${message || "Analyze the uploaded material."}
         ];
 
         /*
-         * IMAGE INPUT
-         *
-         * Expected:
-         * {
-         *   mimeType: "image/jpeg",
-         *   data: "BASE64..."
-         * }
-         */
+        ============================================================
+        IMAGE SUPPORT
+        ============================================================
+        */
 
         if (image && image.data) {
 
@@ -416,7 +402,8 @@ ${message || "Analyze the uploaded material."}
                     statusCode: 400,
                     headers,
                     body: JSON.stringify({
-                        error: "Image MIME type is missing."
+                        error: "Image MIME type is missing.",
+                        requestId
                     })
                 };
             }
@@ -430,10 +417,10 @@ ${message || "Analyze the uploaded material."}
         }
 
         /*
-         * FILE INPUT
-         *
-         * Supports PDF and other supported inline media.
-         */
+        ============================================================
+        FILE / PDF SUPPORT
+        ============================================================
+        */
 
         if (file && file.data) {
 
@@ -442,7 +429,8 @@ ${message || "Analyze the uploaded material."}
                     statusCode: 400,
                     headers,
                     body: JSON.stringify({
-                        error: "File MIME type is missing."
+                        error: "File MIME type is missing.",
+                        requestId
                     })
                 };
             }
@@ -456,14 +444,18 @@ ${message || "Analyze the uploaded material."}
         }
 
         /*
-         * ---------------------------------------------------------
-         * GEMINI API REQUEST
-         * ---------------------------------------------------------
-         */
+        ============================================================
+        GEMINI REQUEST
+        ============================================================
+        */
 
-        const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-            {
+        async function callGemini(model) {
+
+            const url =
+                `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+            const response = await fetch(url, {
+
                 method: "POST",
 
                 headers: {
@@ -489,48 +481,201 @@ ${message || "Analyze the uploaded material."}
                     ],
 
                     generationConfig: {
-                        temperature: 0.6,
-                        maxOutputTokens: 8192
+
+                        maxOutputTokens: 8192,
+
+                        thinkingConfig: {
+                            thinkingLevel: "medium"
+                        }
+
                     }
+
                 })
-            }
-        );
 
-        const result = await response.json();
+            });
 
-        /*
-         * ---------------------------------------------------------
-         * GEMINI ERROR
-         * ---------------------------------------------------------
-         */
-
-        if (!response.ok) {
-
-            console.error(
-                "Gemini API error:",
-                JSON.stringify(result, null, 2)
-            );
+            const result = await response.json();
 
             return {
-                statusCode: response.status,
+                response,
+                result
+            };
+        }
+
+        /*
+        ============================================================
+        MODEL FALLBACK ENGINE
+        ============================================================
+        */
+
+        let finalResult = null;
+        let successfulModel = null;
+        let lastError = null;
+
+        for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
+
+            const model = models[modelIndex];
+
+            console.log(
+                `[BoardMate] ${requestId} trying ${model}`
+            );
+
+            /*
+            Retry each model up to 2 times.
+            */
+
+            for (let attempt = 0; attempt < 2; attempt++) {
+
+                try {
+
+                    const { response, result } =
+                        await callGemini(model);
+
+                    /*
+                    SUCCESS
+                    */
+
+                    if (response.ok) {
+
+                        finalResult = result;
+                        successfulModel = model;
+
+                        console.log(
+                            `[BoardMate] ${requestId} success with ${model}`
+                        );
+
+                        break;
+                    }
+
+                    lastError =
+                        result?.error?.message ||
+                        `Gemini returned HTTP ${response.status}`;
+
+                    console.error(
+                        `[BoardMate] ${requestId} ${model} HTTP ${response.status}:`,
+                        lastError
+                    );
+
+                    /*
+                    NON-RETRYABLE ERROR
+
+                    Example:
+                    400
+                    401
+                    403
+                    404
+                    */
+
+                    if (!retryableStatuses.has(response.status)) {
+
+                        return {
+                            statusCode: response.status,
+                            headers,
+                            body: JSON.stringify({
+                                error: lastError,
+                                model,
+                                requestId
+                            })
+                        };
+                    }
+
+                    /*
+                    RETRYABLE ERROR
+
+                    Wait:
+
+                    attempt 0 → ~1 second
+                    attempt 1 → ~2 seconds
+                    */
+
+                    if (attempt < 1) {
+
+                        const delay =
+                            1000 * Math.pow(2, attempt) +
+                            Math.floor(Math.random() * 300);
+
+                        console.log(
+                            `[BoardMate] ${requestId} retrying ${model} in ${delay}ms`
+                        );
+
+                        await sleep(delay);
+                    }
+
+                } catch (error) {
+
+                    lastError =
+                        error?.message ||
+                        "Unknown network error.";
+
+                    console.error(
+                        `[BoardMate] ${requestId} network error with ${model}:`,
+                        lastError
+                    );
+
+                    if (attempt < 1) {
+
+                        const delay =
+                            1000 * Math.pow(2, attempt) +
+                            Math.floor(Math.random() * 300);
+
+                        await sleep(delay);
+                    }
+                }
+            }
+
+            /*
+            If successful, stop trying other models.
+            */
+
+            if (successfulModel) {
+                break;
+            }
+
+            /*
+            Otherwise automatically move to
+            the next model.
+            */
+
+            console.log(
+                `[BoardMate] ${requestId} switching from ${model}`
+            );
+        }
+
+        /*
+        ============================================================
+        ALL MODELS FAILED
+        ============================================================
+        */
+
+        if (!successfulModel || !finalResult) {
+
+            return {
+                statusCode: 503,
                 headers,
                 body: JSON.stringify({
+
                     error:
-                        result?.error?.message ||
-                        "Gemini API request failed."
+                        "All BoardMate AI models are temporarily unavailable. Please try again shortly.",
+
+                    requestId,
+
+                    details:
+                        lastError || "No model returned a response."
+
                 })
             };
         }
 
         /*
-         * ---------------------------------------------------------
-         * EXTRACT RESPONSE
-         * ---------------------------------------------------------
-         */
+        ============================================================
+        EXTRACT ANSWER
+        ============================================================
+        */
 
         let answer = "";
 
-        const candidates = result?.candidates || [];
+        const candidates =
+            finalResult?.candidates || [];
 
         if (candidates.length > 0) {
 
@@ -543,17 +688,10 @@ ${message || "Analyze the uploaded material."}
                 .trim();
         }
 
-        /*
-         * ---------------------------------------------------------
-         * EMPTY RESPONSE
-         * ---------------------------------------------------------
-         */
-
         if (!answer) {
 
             console.error(
-                "Gemini returned no text:",
-                JSON.stringify(result, null, 2)
+                `[BoardMate] ${requestId} Gemini returned no text`
             );
 
             return {
@@ -561,33 +699,61 @@ ${message || "Analyze the uploaded material."}
                 headers,
                 body: JSON.stringify({
                     error:
-                        "Gemini returned no usable answer."
+                        "Gemini returned no usable answer.",
+                    requestId,
+                    model: successfulModel
                 })
             };
         }
 
         /*
-         * ---------------------------------------------------------
-         * CLEAN FORMATTING
-         * ---------------------------------------------------------
-         */
+        ============================================================
+        CLEAN MARKDOWN / LATEX
+        ============================================================
+        */
 
         answer = answer
-            .replace(/\\text\{([^{}]*)\}/g, "$1")
-            .replace(/\\mathrm\{([^{}]*)\}/g, "$1")
-            .replace(/\\mathbf\{([^{}]*)\}/g, "$1")
-            .replace(/\$\$/g, "")
-            .replace(/\\\[/g, "")
-            .replace(/\\\]/g, "")
+
+            .replace(
+                /\\text\{([^{}]*)\}/g,
+                "$1"
+            )
+
+            .replace(
+                /\\mathrm\{([^{}]*)\}/g,
+                "$1"
+            )
+
+            .replace(
+                /\\mathbf\{([^{}]*)\}/g,
+                "$1"
+            )
+
+            .replace(
+                /\$\$/g,
+                ""
+            )
+
+            .replace(
+                /\\\[/g,
+                ""
+            )
+
+            .replace(
+                /\\\]/g,
+                ""
+            )
+
             .trim();
 
         /*
-         * ---------------------------------------------------------
-         * SUCCESS
-         * ---------------------------------------------------------
-         */
+        ============================================================
+        SUCCESS RESPONSE
+        ============================================================
+        */
 
         return {
+
             statusCode: 200,
 
             headers: {
@@ -596,11 +762,19 @@ ${message || "Analyze the uploaded material."}
             },
 
             body: JSON.stringify({
+
                 success: true,
+
                 answer,
+
                 mode,
-                model
+
+                model: successfulModel,
+
+                requestId
+
             })
+
         };
 
     } catch (error) {
@@ -611,13 +785,21 @@ ${message || "Analyze the uploaded material."}
         );
 
         return {
+
             statusCode: 500,
+
             headers,
+
             body: JSON.stringify({
+
                 error:
                     "BoardMate AI server error: " +
-                    (error?.message || "Unknown error")
+                    (error?.message || "Unknown error."),
+
+                requestId
+
             })
+
         };
     }
 };
